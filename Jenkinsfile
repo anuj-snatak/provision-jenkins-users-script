@@ -2,12 +2,12 @@ pipeline {
     agent any
 
     environment {
-        // Jenkins connection – adjust these!
-        JENKINS_URL = 'http://54.188.28.149:8080/'   // CHANGE
-        ADMIN_USER = 'admin'                                 // CHANGE if different
-        ADMIN_TOKEN = credentials('jenkins-admin-token')     // ID of your secret text credential
+        // Jenkins connection – CHANGE THESE!
+        JENKINS_URL = 'http://54.188.28.149:8080/'   // your Jenkins URL
+        ADMIN_USER = 'admin'                                 // admin username
+        ADMIN_TOKEN = credentials('jenkins-admin-token')     // secret text credential
 
-        // SMTP (Gmail app password) – adjust!
+        // SMTP (Gmail app password) – CHANGE THESE!
         SMTP_CREDS = credentials('smtp-creds')
         SMTP_USER = "${SMTP_CREDS_USR}"
         SMTP_PASSWORD = "${SMTP_CREDS_PSW}"
@@ -27,20 +27,22 @@ pipeline {
             }
         }
 
-        stage('Run Provisioning in Docker') {
-            agent {
-                docker {
-                    image 'python:3-slim'
-                    reuseNode true   // use the same workspace
-                }
-            }
+        stage('Install Python Dependencies') {
             steps {
                 sh '''
-                    # Install only the required Python packages
-                    pip install --no-cache-dir requests urllib3
+                    # Install Python packages for the Jenkins user only
+                    pip install --user --upgrade pip
+                    pip install --user requests urllib3
+                '''
+            }
+        }
 
-                    # Execute the provisioning script
-                    python provision_jenkins_users.py
+        stage('Provision Users') {
+            steps {
+                sh '''
+                    # Add user's local Python bin to PATH (so installed packages are found)
+                    export PATH=$HOME/.local/bin:$PATH
+                    python3 provision_jenkins_users.py
                 '''
             }
         }
@@ -54,7 +56,7 @@ pipeline {
             emailext(
                 subject: "User Provisioning FAILED - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
                 body: "Check console: ${env.BUILD_URL}console",
-                to: 'aditya.tripathi998@gmail.com'   // CHANGE to your email/team
+                to: 'your.name@gmail.com'   // CHANGE to your email / team
             )
         }
     }
