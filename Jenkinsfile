@@ -3,7 +3,7 @@ pipeline {
 
     environment {
         // Jenkins connection – CHANGE THESE!
-        JENKINS_URL = 'http://54.188.28.149:8080/'   // your Jenkins URL
+        JENKINS_URL = 'http://localhost:8080/'   // your Jenkins URL
         ADMIN_USER = 'admin'
         ADMIN_TOKEN = credentials('jenkins-admin-token')
 
