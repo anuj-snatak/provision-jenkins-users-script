@@ -7,19 +7,20 @@ import string
 import smtplib
 import logging
 import requests
+import time
 from email.message import EmailMessage
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ------------------ CONFIGURATION (from environment) ------------------
-JENKINS_URL = os.environ.get('JENKINS_URL', 'https://jenkins.company.com')
+JENKINS_URL = os.environ.get('JENKINS_URL', 'http://localhost:8080').rstrip('/')
 ADMIN_USER = os.environ.get('ADMIN_USER', 'admin')
-ADMIN_TOKEN = os.environ.get('ADMIN_TOKEN')          # injected via Jenkins credential
-SMTP_SERVER = os.environ.get('SMTP_SERVER', 'smtp.company.com')
+ADMIN_TOKEN = os.environ.get('ADMIN_TOKEN')
+SMTP_SERVER = os.environ.get('SMTP_SERVER', 'smtp.gmail.com')
 SMTP_PORT = int(os.environ.get('SMTP_PORT', 587))
-SMTP_USER = os.environ.get('SMTP_USER', 'jenkins@company.com')
+SMTP_USER = os.environ.get('SMTP_USER')
 SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD')
-FROM_EMAIL = os.environ.get('FROM_EMAIL', 'jenkins@company.com')
+FROM_EMAIL = os.environ.get('FROM_EMAIL', SMTP_USER)
 CSV_PATH = os.environ.get('CSV_PATH', 'users.csv')
 
 # ------------------ LOGGING ------------------
@@ -31,7 +32,7 @@ def generate_password(length=14):
     chars = string.ascii_letters + string.digits + "!@#$%^&*"
     return ''.join(secrets.choice(chars) for _ in range(length))
 
-def requests_retry_session(retries=3, backoff_factor=0.5):
+def requests_retry_session(retries=3, backoff_factor=1):
     session = requests.Session()
     retry = Retry(
         total=retries,
@@ -47,7 +48,7 @@ def requests_retry_session(retries=3, backoff_factor=0.5):
 
 # ------------------ JENKINS API INTERACTIONS ------------------
 def user_exists(username):
-    """Check if user already exists."""
+    """Check if user already exists via API."""
     url = f"{JENKINS_URL}/securityRealm/user/{username}/api/json"
     resp = requests_retry_session().get(url, auth=(ADMIN_USER, ADMIN_TOKEN))
     if resp.status_code == 200:
@@ -55,10 +56,11 @@ def user_exists(username):
     elif resp.status_code == 404:
         return False
     else:
+        logger.error(f"User existence check failed: {resp.status_code} - {resp.text}")
         resp.raise_for_status()
 
 def create_user(username, password, email, fullname=None):
-    """Create a new Jenkins user."""
+    """Create a new Jenkins user with robust error checking."""
     url = f"{JENKINS_URL}/securityRealm/createAccountByAdmin"
     data = {
         "username": username,
@@ -67,13 +69,53 @@ def create_user(username, password, email, fullname=None):
         "fullname": fullname or username,
         "email": email
     }
-    resp = requests_retry_session().post(url, auth=(ADMIN_USER, ADMIN_TOKEN), data=data)
-    resp.raise_for_status()
-    logger.info(f"User '{username}' created.")
+    logger.info(f"Creating user '{username}' via POST to {url}")
+    resp = requests_retry_session().post(url, auth=(ADMIN_USER, ADMIN_TOKEN), data=data, allow_redirects=False)
+    
+    # Jenkins returns 302 Redirect on success, not 200!
+    if resp.status_code == 302:
+        logger.info(f"User '{username}' created successfully (redirect detected).")
+        # Wait a moment for Jenkins to persist the user
+        time.sleep(2)
+        # Verify user actually exists
+        if not user_exists(username):
+            raise RuntimeError(f"User '{username}' was reported created but does not exist after creation.")
+        return True
+    else:
+        logger.error(f"User creation failed. Status: {resp.status_code}, Response: {resp.text[:500]}")
+        raise RuntimeError(f"Failed to create user {username}: HTTP {resp.status_code}")
 
 def assign_role(username, role):
-    """Assign a global role to the user via Groovy script console."""
-    groovy_script = f"""
+    """Assign a global role to the user via Groovy, with output validation."""
+    # First, verify that the role exists in Jenkins
+    groovy_check_role = f"""
+import jenkins.model.*
+import com.michelin.cio.hudson.plugins.rolestrategy.*
+
+def strategy = Jenkins.instance.getAuthorizationStrategy()
+if (!(strategy instanceof RoleBasedAuthorizationStrategy)) {{
+    println "ERROR: RoleBasedAuthorizationStrategy not active"
+    return
+}}
+def globalRoles = strategy.getGrantedRoles(RoleBasedAuthorizationStrategy.GLOBAL)
+def roleExists = globalRoles.any {{ it.key.name == "{role}" }}
+if (!roleExists) {{
+    println "ERROR: Role '{role}' does not exist in Global roles"
+    return
+}}
+println "OK: Role exists"
+"""
+    url = f"{JENKINS_URL}/scriptText"
+    check_resp = requests_retry_session().post(
+        url,
+        auth=(ADMIN_USER, ADMIN_TOKEN),
+        data={"script": groovy_check_role}
+    )
+    if "ERROR" in check_resp.text:
+        raise RuntimeError(f"Role validation failed: {check_resp.text.strip()}")
+
+    # Now assign the role
+    groovy_assign = f"""
 import jenkins.model.*
 import com.michelin.cio.hudson.plugins.rolestrategy.*
 
@@ -82,20 +124,19 @@ def strategy = jenkins.getAuthorizationStrategy()
 if (strategy instanceof RoleBasedAuthorizationStrategy) {{
     strategy.assignRole(RoleBasedAuthorizationStrategy.GLOBAL, "{role}", "{username}")
     jenkins.save()
-    println "Role {role} assigned to {username}"
+    println "ASSIGNED"
 }} else {{
-    println "RoleBasedAuthorizationStrategy is NOT active"
+    println "ERROR: RBAC not active"
 }}
 """
-    url = f"{JENKINS_URL}/scriptText"
-    resp = requests_retry_session().post(
+    assign_resp = requests_retry_session().post(
         url,
         auth=(ADMIN_USER, ADMIN_TOKEN),
-        data={"script": groovy_script}
+        data={"script": groovy_assign}
     )
-    resp.raise_for_status()
-    if "RoleBasedAuthorizationStrategy is NOT active" in resp.text:
-        raise RuntimeError("RBAC plugin not configured. Cannot assign role.")
+    if "ASSIGNED" not in assign_resp.text:
+        logger.error(f"Role assignment failed: {assign_resp.text}")
+        raise RuntimeError(f"Failed to assign role {role} to {username}")
     logger.info(f"Role '{role}' assigned to '{username}'.")
 
 def get_current_role(username):
@@ -122,7 +163,7 @@ if (strategy instanceof RoleBasedAuthorizationStrategy) {{
     )
     resp.raise_for_status()
     role = resp.text.strip()
-    return None if role == "NONE" or "RoleBasedAuthorizationStrategy" in role else role
+    return None if role == "NONE" else role
 
 # ------------------ EMAIL ------------------
 def send_email(username, email, password, role):
@@ -155,7 +196,6 @@ DevOps Automation
 
 # ------------------ MAIN PROVISIONING LOOP ------------------
 def main():
-    # Validate required env vars
     if not ADMIN_TOKEN:
         logger.error("ADMIN_TOKEN environment variable not set.")
         sys.exit(1)
@@ -181,7 +221,7 @@ def main():
         logger.info(f"Processing {username}...")
 
         try:
-            # 1. Check existence
+            # 1. Check if user already exists
             exists = user_exists(username)
 
             if not exists:
@@ -198,13 +238,13 @@ def main():
                 send_email(username, email, password, role)
                 logger.info(f"✓ {username} created, role assigned, email sent.")
             else:
-                # Idempotency: check current role
+                # Idempotency: verify current role
                 current_role = get_current_role(username)
                 if current_role != role:
                     logger.info(f"Updating role for {username} from '{current_role}' to '{role}'")
                     assign_role(username, role)
                 else:
-                    logger.info(f"{username} already has role '{role}'. No action.")
+                    logger.info(f"{username} already exists with role '{role}'. No action.")
             success_count += 1
 
         except Exception as e:
