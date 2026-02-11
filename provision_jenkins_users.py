@@ -46,6 +46,23 @@ def requests_retry_session(retries=3, backoff_factor=1):
     session.mount('https://', adapter)
     return session
 
+# ------------------ JENKINS CRUMB (CSRF) HANDLING ------------------
+def get_crumb():
+    """Fetch a valid crumb token for CSRF-protected POST requests."""
+    url = f"{JENKINS_URL}/crumbIssuer/api/json"
+    try:
+        resp = requests_retry_session().get(url, auth=(ADMIN_USER, ADMIN_TOKEN), timeout=10)
+        if resp.status_code == 200:
+            crumb_data = resp.json()
+            logger.debug(f"Crumb fetched: {crumb_data}")
+            return {crumb_data["crumbRequestField"]: crumb_data["crumb"]}
+        else:
+            logger.warning("Crumb issuer not available or returned non-200. Proceeding without crumb.")
+            return {}
+    except Exception as e:
+        logger.warning(f"Failed to fetch crumb: {e}. Proceeding without crumb.")
+        return {}
+
 # ------------------ JENKINS API INTERACTIONS ------------------
 def user_exists(username):
     """Check if user already exists via API."""
@@ -56,12 +73,14 @@ def user_exists(username):
     elif resp.status_code == 404:
         return False
     else:
-        logger.error(f"User existence check failed: {resp.status_code} - {resp.text}")
+        logger.error(f"User existence check failed: {resp.status_code} - {resp.text[:200]}")
         resp.raise_for_status()
 
 def create_user(username, password, email, fullname=None):
-    """Create a new Jenkins user with robust error checking."""
+    """Create a new Jenkins user with CSRF crumb handling."""
     url = f"{JENKINS_URL}/securityRealm/createAccountByAdmin"
+    
+    # Prepare form data
     data = {
         "username": username,
         "password1": password,
@@ -69,12 +88,21 @@ def create_user(username, password, email, fullname=None):
         "fullname": fullname or username,
         "email": email
     }
+    
+    # Add crumb if available
+    crumb = get_crumb()
+    if crumb:
+        data.update(crumb)
+        logger.info("Including CSRF crumb in request.")
+    else:
+        logger.warning("No crumb – proceeding without CSRF token. May fail if CSRF is enforced.")
+    
     logger.info(f"Creating user '{username}' via POST to {url}")
     resp = requests_retry_session().post(url, auth=(ADMIN_USER, ADMIN_TOKEN), data=data, allow_redirects=False)
     
-    # Jenkins returns 302 Redirect on success, not 200!
+    # Success is indicated by HTTP 302 (redirect)
     if resp.status_code == 302:
-        logger.info(f"User '{username}' created successfully (redirect detected).")
+        logger.info(f"User '{username}' created successfully (302 redirect).")
         # Wait a moment for Jenkins to persist the user
         time.sleep(2)
         # Verify user actually exists
@@ -82,8 +110,15 @@ def create_user(username, password, email, fullname=None):
             raise RuntimeError(f"User '{username}' was reported created but does not exist after creation.")
         return True
     else:
-        logger.error(f"User creation failed. Status: {resp.status_code}, Response: {resp.text[:500]}")
-        raise RuntimeError(f"Failed to create user {username}: HTTP {resp.status_code}")
+        # On failure, the response is HTTP 200 with the HTML form + error message
+        logger.error(f"User creation failed. Status: {resp.status_code}, Response preview: {resp.text[:500]}")
+        # Try to extract error reason from HTML (optional)
+        if "User name is already taken" in resp.text:
+            raise RuntimeError(f"User '{username}' already exists (creation attempted anyway).")
+        elif "Invalid email address" in resp.text:
+            raise RuntimeError(f"Invalid email address for user '{username}'.")
+        else:
+            raise RuntimeError(f"Failed to create user {username}: HTTP {resp.status_code}")
 
 def assign_role(username, role):
     """Assign a global role to the user via Groovy, with output validation."""
