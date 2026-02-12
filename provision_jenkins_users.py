@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+"""
+Production‑grade Jenkins User Provisioning Script
+Features:
+- Idempotent user creation & role assignment
+- CSRF crumb handling
+- Robust error detection (parses HTML error messages)
+- Secure password generation (never logged)
+- Email notification only for new users
+"""
+
 import csv
 import os
 import sys
@@ -12,7 +22,9 @@ from email.message import EmailMessage
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ------------------ CONFIGURATION (from environment) ------------------
+# ----------------------------------------------------------------------
+# Environment configuration – all secrets injected via Jenkins credentials
+# ----------------------------------------------------------------------
 JENKINS_URL = os.environ.get('JENKINS_URL', 'http://localhost:8080').rstrip('/')
 ADMIN_USER = os.environ.get('ADMIN_USER', 'admin')
 ADMIN_TOKEN = os.environ.get('ADMIN_TOKEN')
@@ -23,16 +35,25 @@ SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD')
 FROM_EMAIL = os.environ.get('FROM_EMAIL', SMTP_USER)
 CSV_PATH = os.environ.get('CSV_PATH', 'users.csv')
 
-# ------------------ LOGGING ------------------
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# ----------------------------------------------------------------------
+# Logging – INFO for pipeline, DEBUG for troubleshooting
+# ----------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger('jenkins_provision')
 
-# ------------------ UTILS ------------------
+# ----------------------------------------------------------------------
+# Utility functions
+# ----------------------------------------------------------------------
 def generate_password(length=14):
+    """Generate a strong random password."""
     chars = string.ascii_letters + string.digits + "!@#$%^&*"
     return ''.join(secrets.choice(chars) for _ in range(length))
 
 def requests_retry_session(retries=3, backoff_factor=1):
+    """Create a requests session with retry strategy."""
     session = requests.Session()
     retry = Retry(
         total=retries,
@@ -46,9 +67,24 @@ def requests_retry_session(retries=3, backoff_factor=1):
     session.mount('https://', adapter)
     return session
 
-# ------------------ JENKINS CRUMB (CSRF) HANDLING ------------------
+def validate_env():
+    """Ensure all required environment variables are set."""
+    missing = []
+    if not ADMIN_TOKEN:
+        missing.append('ADMIN_TOKEN')
+    if not SMTP_USER:
+        missing.append('SMTP_USER (from smtp-creds username)')
+    if not SMTP_PASSWORD:
+        missing.append('SMTP_PASSWORD (from smtp-creds password)')
+    if missing:
+        logger.error(f"Missing required environment variables: {', '.join(missing)}")
+        sys.exit(1)
+
+# ----------------------------------------------------------------------
+# Jenkins CSRF crumb handling
+# ----------------------------------------------------------------------
 def get_crumb():
-    """Fetch a valid crumb token for CSRF-protected POST requests."""
+    """Fetch a valid CSRF crumb for form posts."""
     url = f"{JENKINS_URL}/crumbIssuer/api/json"
     try:
         resp = requests_retry_session().get(url, auth=(ADMIN_USER, ADMIN_TOKEN), timeout=10)
@@ -57,30 +93,44 @@ def get_crumb():
             logger.debug(f"Crumb fetched: {crumb_data}")
             return {crumb_data["crumbRequestField"]: crumb_data["crumb"]}
         else:
-            logger.warning("Crumb issuer not available or returned non-200. Proceeding without crumb.")
+            logger.warning(f"Crumb issuer returned {resp.status_code}. Proceeding without crumb.")
             return {}
     except Exception as e:
         logger.warning(f"Failed to fetch crumb: {e}. Proceeding without crumb.")
         return {}
 
-# ------------------ JENKINS API INTERACTIONS ------------------
+# ----------------------------------------------------------------------
+# Jenkins API: User existence check
+# ----------------------------------------------------------------------
 def user_exists(username):
-    """Check if user already exists via API."""
+    """Return True if the user already exists in Jenkins."""
     url = f"{JENKINS_URL}/securityRealm/user/{username}/api/json"
-    resp = requests_retry_session().get(url, auth=(ADMIN_USER, ADMIN_TOKEN))
-    if resp.status_code == 200:
-        return True
-    elif resp.status_code == 404:
-        return False
-    else:
-        logger.error(f"User existence check failed: {resp.status_code} - {resp.text[:200]}")
-        resp.raise_for_status()
+    logger.debug(f"Checking existence of user '{username}' via GET {url}")
+    try:
+        resp = requests_retry_session().get(url, auth=(ADMIN_USER, ADMIN_TOKEN), timeout=10)
+        if resp.status_code == 200:
+            logger.debug(f"User '{username}' exists.")
+            return True
+        elif resp.status_code == 404:
+            logger.debug(f"User '{username}' does NOT exist.")
+            return False
+        else:
+            logger.error(f"User existence check failed (HTTP {resp.status_code}) – {resp.text[:200]}")
+            resp.raise_for_status()
+    except Exception as e:
+        logger.error(f"Exception during user existence check: {e}")
+        raise
 
+# ----------------------------------------------------------------------
+# Jenkins API: Create user (with CSRF and error parsing)
+# ----------------------------------------------------------------------
 def create_user(username, password, email, fullname=None):
-    """Create a new Jenkins user with CSRF crumb handling."""
+    """
+    Create a new Jenkins user.
+    Returns True if user was created, False if user already existed.
+    Raises exception on other failures.
+    """
     url = f"{JENKINS_URL}/securityRealm/createAccountByAdmin"
-    
-    # Prepare form data
     data = {
         "username": username,
         "password1": password,
@@ -88,42 +138,63 @@ def create_user(username, password, email, fullname=None):
         "fullname": fullname or username,
         "email": email
     }
-    
-    # Add crumb if available
+
+    # Add CSRF crumb if available
     crumb = get_crumb()
     if crumb:
         data.update(crumb)
-        logger.info("Including CSRF crumb in request.")
+        logger.debug("Including CSRF crumb in request.")
     else:
-        logger.warning("No crumb – proceeding without CSRF token. May fail if CSRF is enforced.")
-    
+        logger.warning("No crumb – CSRF may cause failure.")
+
     logger.info(f"Creating user '{username}' via POST to {url}")
-    resp = requests_retry_session().post(url, auth=(ADMIN_USER, ADMIN_TOKEN), data=data, allow_redirects=False)
-    
-    # Success is indicated by HTTP 302 (redirect)
+    resp = requests_retry_session().post(
+        url,
+        auth=(ADMIN_USER, ADMIN_TOKEN),
+        data=data,
+        allow_redirects=False,
+        timeout=15
+    )
+
+    # ---------- SUCCESS: HTTP 302 Redirect ----------
     if resp.status_code == 302:
         logger.info(f"User '{username}' created successfully (302 redirect).")
-        # Wait a moment for Jenkins to persist the user
-        time.sleep(2)
-        # Verify user actually exists
+        time.sleep(2)  # allow Jenkins to persist the user
+        # Double-check that the user now exists
         if not user_exists(username):
             raise RuntimeError(f"User '{username}' was reported created but does not exist after creation.")
-        return True
-    else:
-        # On failure, the response is HTTP 200 with the HTML form + error message
-        logger.error(f"User creation failed. Status: {resp.status_code}, Response preview: {resp.text[:500]}")
-        # Try to extract error reason from HTML (optional)
-        if "User name is already taken" in resp.text:
-            raise RuntimeError(f"User '{username}' already exists (creation attempted anyway).")
-        elif "Invalid email address" in resp.text:
-            raise RuntimeError(f"Invalid email address for user '{username}'.")
-        else:
-            raise RuntimeError(f"Failed to create user {username}: HTTP {resp.status_code}")
+        return True   # new user created
 
+    # ---------- FAILURE: HTTP 200 (form returned with error) ----------
+    elif resp.status_code == 200:
+        logger.debug(f"User creation returned HTTP 200. Checking response body for known errors.")
+        # Look for "User name is already taken"
+        if "User name is already taken" in resp.text:
+            logger.warning(f"User '{username}' already exists (detected via HTML). Proceeding idempotently.")
+            # Verify via API to be sure
+            if user_exists(username):
+                logger.info(f"Confirmed user '{username}' exists via API.")
+                return False   # user already existed, no creation done
+            else:
+                raise RuntimeError(f"HTML indicated user '{username}' exists, but API check says otherwise.")
+        else:
+            # Some other validation error – log full response for debugging
+            logger.error(f"User creation failed with HTTP 200. Full response body:\n{resp.text[:2000]}")
+            raise RuntimeError(f"Failed to create user {username}: HTTP 200 with unknown error")
+
+    # ---------- OTHER HTTP STATUS CODES ----------
+    else:
+        logger.error(f"User creation failed with unexpected status {resp.status_code}")
+        logger.error(f"Response preview: {resp.text[:500]}")
+        raise RuntimeError(f"Failed to create user {username}: HTTP {resp.status_code}")
+
+# ----------------------------------------------------------------------
+# Jenkins API: Role assignment via Groovy
+# ----------------------------------------------------------------------
 def assign_role(username, role):
-    """Assign a global role to the user via Groovy, with output validation."""
-    # First, verify that the role exists in Jenkins
-    groovy_check_role = f"""
+    """Assign a global role to the user. Raises exception on failure."""
+    # Step 1: Verify that the role exists in Jenkins
+    groovy_check = f"""
 import jenkins.model.*
 import com.michelin.cio.hudson.plugins.rolestrategy.*
 
@@ -141,15 +212,18 @@ if (!roleExists) {{
 println "OK: Role exists"
 """
     url = f"{JENKINS_URL}/scriptText"
+    logger.debug(f"Checking if role '{role}' exists via Groovy.")
     check_resp = requests_retry_session().post(
         url,
         auth=(ADMIN_USER, ADMIN_TOKEN),
-        data={"script": groovy_check_role}
+        data={"script": groovy_check},
+        timeout=15
     )
+    check_resp.raise_for_status()
     if "ERROR" in check_resp.text:
         raise RuntimeError(f"Role validation failed: {check_resp.text.strip()}")
 
-    # Now assign the role
+    # Step 2: Assign the role
     groovy_assign = f"""
 import jenkins.model.*
 import com.michelin.cio.hudson.plugins.rolestrategy.*
@@ -164,18 +238,21 @@ if (strategy instanceof RoleBasedAuthorizationStrategy) {{
     println "ERROR: RBAC not active"
 }}
 """
+    logger.debug(f"Assigning role '{role}' to '{username}' via Groovy.")
     assign_resp = requests_retry_session().post(
         url,
         auth=(ADMIN_USER, ADMIN_TOKEN),
-        data={"script": groovy_assign}
+        data={"script": groovy_assign},
+        timeout=15
     )
+    assign_resp.raise_for_status()
     if "ASSIGNED" not in assign_resp.text:
-        logger.error(f"Role assignment failed: {assign_resp.text}")
+        logger.error(f"Role assignment failed. Script output: {assign_resp.text}")
         raise RuntimeError(f"Failed to assign role {role} to {username}")
     logger.info(f"Role '{role}' assigned to '{username}'.")
 
 def get_current_role(username):
-    """Retrieve the current global role of a user (if any)."""
+    """Return the current global role of the user, or None if none assigned."""
     groovy_script = f"""
 import jenkins.model.*
 import com.michelin.cio.hudson.plugins.rolestrategy.*
@@ -194,14 +271,18 @@ if (strategy instanceof RoleBasedAuthorizationStrategy) {{
     resp = requests_retry_session().post(
         url,
         auth=(ADMIN_USER, ADMIN_TOKEN),
-        data={"script": groovy_script}
+        data={"script": groovy_script},
+        timeout=15
     )
     resp.raise_for_status()
     role = resp.text.strip()
     return None if role == "NONE" else role
 
-# ------------------ EMAIL ------------------
+# ----------------------------------------------------------------------
+# Email notification (only for new users)
+# ----------------------------------------------------------------------
 def send_email(username, email, password, role):
+    """Send an email with account credentials."""
     msg = EmailMessage()
     msg["Subject"] = "Your Jenkins Account Access"
     msg["From"] = FROM_EMAIL
@@ -222,28 +303,33 @@ Regards,
 DevOps Automation
 """
     msg.set_content(body)
-    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-        if SMTP_PORT == 587:
-            server.starttls()
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.send_message(msg)
-    logger.info(f"Email sent to {email}")
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            if SMTP_PORT == 587:
+                server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+        logger.info(f"Email sent to {email}")
+    except Exception as e:
+        logger.error(f"Failed to send email to {email}: {e}")
+        raise
 
-# ------------------ MAIN PROVISIONING LOOP ------------------
+# ----------------------------------------------------------------------
+# Main provisioning logic
+# ----------------------------------------------------------------------
 def main():
-    if not ADMIN_TOKEN:
-        logger.error("ADMIN_TOKEN environment variable not set.")
-        sys.exit(1)
+    validate_env()
 
     # Read CSV
     try:
-        with open(CSV_PATH, newline='') as csvfile:
+        with open(CSV_PATH, newline='', encoding='utf-8') as csvfile:
             reader = csv.DictReader(csvfile)
-            if not {'username', 'email', 'role'}.issubset(reader.fieldnames):
-                raise ValueError("CSV must contain 'username', 'email', 'role' columns")
+            required = {'username', 'email', 'role'}
+            if not required.issubset(reader.fieldnames):
+                raise ValueError(f"CSV must contain columns: {required}")
             users = list(reader)
     except Exception as e:
-        logger.error(f"Failed to read CSV: {e}")
+        logger.critical(f"Failed to read CSV: {e}")
         sys.exit(1)
 
     success_count = 0
@@ -253,40 +339,50 @@ def main():
         username = user['username'].strip()
         email = user['email'].strip()
         role = user['role'].strip().lower()
-        logger.info(f"Processing {username}...")
+        logger.info(f"=== Processing {username} ===")
 
         try:
-            # 1. Check if user already exists
+            # Step 1: Does the user already exist?
             exists = user_exists(username)
 
+            # Step 2: Create user if it does not exist
             if not exists:
-                # Generate password
                 password = generate_password()
-
-                # Create user
-                create_user(username, password, email)
-
-                # Assign role
-                assign_role(username, role)
-
-                # Send email
-                send_email(username, email, password, role)
-                logger.info(f"✓ {username} created, role assigned, email sent.")
+                created = create_user(username, password, email)
+                if created:
+                    # New user created → assign role and send email
+                    assign_role(username, role)
+                    send_email(username, email, password, role)
+                    logger.info(f"✓ {username} – created, role assigned, email sent.")
+                else:
+                    # create_user returned False meaning user already existed (idempotent)
+                    # We already verified via user_exists, but this is a fallback.
+                    logger.info(f"User {username} already exists. Skipping creation.")
+                    # Still ensure correct role
+                    current_role = get_current_role(username)
+                    if current_role != role:
+                        logger.info(f"Updating role for {username} from '{current_role}' to '{role}'")
+                        assign_role(username, role)
+                    else:
+                        logger.info(f"{username} already has role '{role}'. No action.")
             else:
-                # Idempotency: verify current role
+                # User exists → no creation, no email
+                logger.info(f"User {username} already exists. Skipping creation.")
+                # Ensure correct role
                 current_role = get_current_role(username)
                 if current_role != role:
                     logger.info(f"Updating role for {username} from '{current_role}' to '{role}'")
                     assign_role(username, role)
                 else:
-                    logger.info(f"{username} already exists with role '{role}'. No action.")
+                    logger.info(f"{username} already has role '{role}'. No action.")
+
             success_count += 1
 
         except Exception as e:
-            logger.error(f"✗ Failed to provision {username}: {e}")
+            logger.exception(f"✗ Failed to provision {username}: {e}")
             fail_count += 1
 
-    logger.info(f"Done. Success: {success_count}, Failures: {fail_count}")
+    logger.info(f"=== Provisioning completed. Success: {success_count}, Failures: {fail_count} ===")
     if fail_count > 0:
         sys.exit(1)
 
