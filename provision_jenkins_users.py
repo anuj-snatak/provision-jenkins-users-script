@@ -4,7 +4,7 @@ Production‑grade Jenkins User Provisioning Script
 Features:
 - Idempotent user creation & role assignment
 - CSRF crumb handling
-- Robust error detection (parses HTML error messages)
+- Robust error detection (parses HTTP 302 success)
 - Secure password generation (never logged)
 - Email notification only for new users
 """
@@ -18,6 +18,7 @@ import smtplib
 import logging
 import requests
 import time
+import re
 from email.message import EmailMessage
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -79,6 +80,14 @@ def validate_env():
     if missing:
         logger.error(f"Missing required environment variables: {', '.join(missing)}")
         sys.exit(1)
+
+def validate_username(username):
+    """Raise ValueError if username contains invalid characters."""
+    if not re.match(r'^[a-zA-Z0-9_\-]+$', username):
+        raise ValueError(
+            f"Invalid username '{username}'. "
+            "Only alphanumeric characters, underscore (_), and dash (-) are allowed."
+        )
 
 # ----------------------------------------------------------------------
 # Jenkins CSRF crumb handling
@@ -168,13 +177,10 @@ def create_user(username, password, email, fullname=None):
     # ---------- HTTP 200: Form returned (usually error) ----------
     elif resp.status_code == 200:
         logger.warning(f"User creation returned HTTP 200. Checking if user already exists via API...")
-        
-        # CRITICAL FIX: Verify existence via reliable API call
         if user_exists(username):
             logger.warning(f"User '{username}' already exists (detected via API). Proceeding idempotently.")
             return False   # user already existed, no creation done
         else:
-            # Log the full response for debugging
             logger.error(f"User creation failed with HTTP 200 and user does NOT exist. Full response:\n{resp.text}")
             raise RuntimeError(f"Failed to create user {username}: HTTP 200 and user does not exist")
 
@@ -185,10 +191,10 @@ def create_user(username, password, email, fullname=None):
         raise RuntimeError(f"Failed to create user {username}: HTTP {resp.status_code}")
 
 # ----------------------------------------------------------------------
-# Jenkins API: Role assignment via Groovy
+# Jenkins API: Role assignment via Groovy (using doAssignRole)
 # ----------------------------------------------------------------------
 def assign_role(username, role):
-    """Assign a global role to the user via Groovy, with output validation."""
+    """Assign a global role to the user. Raises exception on failure."""
     # Step 1: Verify that the role exists in Jenkins
     groovy_check = f"""
 import jenkins.model.*
@@ -246,6 +252,33 @@ if (strategy instanceof RoleBasedAuthorizationStrategy) {{
         logger.error(f"Role assignment failed. Script output: {assign_resp.text}")
         raise RuntimeError(f"Failed to assign role {role} to {username}")
     logger.info(f"Role '{role}' assigned to '{username}'.")
+
+def get_current_role(username):
+    """Return the current global role of the user, or None if none assigned."""
+    groovy_script = f"""
+import jenkins.model.*
+import com.michelin.cio.hudson.plugins.rolestrategy.*
+
+def jenkins = Jenkins.getInstance()
+def strategy = jenkins.getAuthorizationStrategy()
+if (strategy instanceof RoleBasedAuthorizationStrategy) {{
+    def roles = strategy.getGrantedRoles(RoleBasedAuthorizationStrategy.GLOBAL)
+    def userRole = roles.find {{ it.value.contains("{username}") }}?.key?.name
+    println userRole ?: "NONE"
+}} else {{
+    println "NONE"
+}}
+"""
+    url = f"{JENKINS_URL}/scriptText"
+    resp = requests_retry_session().post(
+        url,
+        auth=(ADMIN_USER, ADMIN_TOKEN),
+        data={"script": groovy_script},
+        timeout=15
+    )
+    resp.raise_for_status()
+    role = resp.text.strip()
+    return None if role == "NONE" else role
 
 # ----------------------------------------------------------------------
 # Email notification (only for new users)
@@ -311,6 +344,9 @@ def main():
         logger.info(f"=== Processing {username} ===")
 
         try:
+            # Validate username format (Jenkins default policy)
+            validate_username(username)
+
             # Step 1: Does the user already exist?
             exists = user_exists(username)
 
@@ -325,7 +361,6 @@ def main():
                     logger.info(f"✓ {username} – created, role assigned, email sent.")
                 else:
                     # create_user returned False meaning user already existed (idempotent)
-                    # We already verified via user_exists, but this is a fallback.
                     logger.info(f"User {username} already exists. Skipping creation.")
                     # Still ensure correct role
                     current_role = get_current_role(username)
