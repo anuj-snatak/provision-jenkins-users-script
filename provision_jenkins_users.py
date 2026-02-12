@@ -194,11 +194,7 @@ def create_user(username, password, email, fullname=None):
 # Jenkins API: Role assignment via Groovy (using doAssignRole)
 # ----------------------------------------------------------------------
 def assign_role(username, role):
-    """
-    Assign a global role to the user.
-    - Removes any existing assignments for this user (cleans ambiguity)
-    - Assigns role explicitly as a USER (isGroup=false)
-    """
+    """Assign a global role to the user. Raises exception on failure."""
     # Step 1: Verify that the role exists in Jenkins
     groovy_check = f"""
 import jenkins.model.*
@@ -229,7 +225,7 @@ println "OK: Role exists"
     if "ERROR" in check_resp.text:
         raise RuntimeError(f"Role validation failed: {check_resp.text.strip()}")
 
-    # Step 2: Assign the role – with full cleanup and explicit user assignment
+    # Step 2: Assign the role (corrected method: doAssignRole)
     groovy_assign = f"""
 import jenkins.model.*
 import com.michelin.cio.hudson.plugins.rolestrategy.*
@@ -237,27 +233,14 @@ import com.michelin.cio.hudson.plugins.rolestrategy.*
 def jenkins = Jenkins.getInstance()
 def strategy = jenkins.getAuthorizationStrategy()
 if (strategy instanceof RoleBasedAuthorizationStrategy) {{
-    def type = RoleBasedAuthorizationStrategy.GLOBAL
-
-    // ---- Remove any existing assignments of this SID from ALL global roles ----
-    def globalRoles = strategy.getGrantedRoles(type)
-    globalRoles.each {{ roleEntry ->
-        def roleName = roleEntry.key.name
-        def sids = roleEntry.value
-        if (sids.contains("{username}")) {{
-            strategy.doUnassignRole(type, roleName, "{username}")
-        }}
-    }}
-
-    // ---- Assign the role explicitly as a USER (isGroup = false) ----
-    strategy.doAssignRole(type, "{role}", "{username}", false)
+    strategy.doAssignRole(RoleBasedAuthorizationStrategy.GLOBAL, "{role}", "{username}")
     jenkins.save()
     println "ASSIGNED"
 }} else {{
     println "ERROR: RBAC not active"
 }}
 """
-    logger.debug(f"Assigning role '{role}' to '{username}' via Groovy (explicit user).")
+    logger.debug(f"Assigning role '{role}' to '{username}' via Groovy.")
     assign_resp = requests_retry_session().post(
         url,
         auth=(ADMIN_USER, ADMIN_TOKEN),
@@ -268,7 +251,34 @@ if (strategy instanceof RoleBasedAuthorizationStrategy) {{
     if "ASSIGNED" not in assign_resp.text:
         logger.error(f"Role assignment failed. Script output: {assign_resp.text}")
         raise RuntimeError(f"Failed to assign role {role} to {username}")
-    logger.info(f"Role '{role}' assigned to '{username}' (explicit user).")
+    logger.info(f"Role '{role}' assigned to '{username}'.")
+
+def get_current_role(username):
+    """Return the current global role of the user, or None if none assigned."""
+    groovy_script = f"""
+import jenkins.model.*
+import com.michelin.cio.hudson.plugins.rolestrategy.*
+
+def jenkins = Jenkins.getInstance()
+def strategy = jenkins.getAuthorizationStrategy()
+if (strategy instanceof RoleBasedAuthorizationStrategy) {{
+    def roles = strategy.getGrantedRoles(RoleBasedAuthorizationStrategy.GLOBAL)
+    def userRole = roles.find {{ it.value.contains("{username}") }}?.key?.name
+    println userRole ?: "NONE"
+}} else {{
+    println "NONE"
+}}
+"""
+    url = f"{JENKINS_URL}/scriptText"
+    resp = requests_retry_session().post(
+        url,
+        auth=(ADMIN_USER, ADMIN_TOKEN),
+        data={"script": groovy_script},
+        timeout=15
+    )
+    resp.raise_for_status()
+    role = resp.text.strip()
+    return None if role == "NONE" else role
 
 # ----------------------------------------------------------------------
 # Email notification (only for new users)
