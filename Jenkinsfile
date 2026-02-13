@@ -3,7 +3,7 @@ pipeline {
 
     environment {
         JENKINS_URL = 'http://localhost:8080/'
-        ADMIN_USER  = 'admin'
+        ADMIN_USER  = 'anuj'
         ADMIN_TOKEN = credentials('jenkins-admin-token')
 
         SMTP_CREDS  = credentials('smtp-creds')
